@@ -3,17 +3,21 @@
 // default branch and never from a PR's code: it fetches PR refs to diff them,
 // but nothing a PR contains is ever checked out or executed here.
 //
+// A PR is merged when GitHub itself reports it mergeable (no conflicts and
+// every ruleset requirement met), the malware scan has passed, and no reviewer
+// has requested changes. The bot adds no rules of its own about PR
+// descriptions, checklists, review threads or which paths a PR touches.
+//
 // For every open PR it decides one of:
-//   MERGE   every condition is met -> squash-merge
+//   MERGE   mergeable and nothing above objects -> squash-merge
 //   WAIT    nothing is wrong, CI is still running -> do nothing
 //   BLOCKED the contributor has something to fix -> sticky comment saying what
-//   HOLD    a maintainer must look (merge gate / workflow approval) -> sticky comment
+//   HOLD    a maintainer must look (CI approval / an unexplained block) -> sticky comment
 //
 // It also approves "action_required" workflow runs from first-time contributors
 // so CI can start, unless the PR changes files CI itself executes from the PR
 // (workflows, scripts); those wait for a maintainer.
 
-const { execFileSync, spawnSync } = require('child_process');
 
 const MARKER = '<!-- assay-automerge -->';
 
@@ -32,13 +36,15 @@ const REVIEW_LABEL = 'needs-maintainer-review';
 const SECURITY_LABEL = 'security-hold'; // set and cleared by malware-scan.yml; read-only here
 const MERGE_METHOD = 'squash';
 
+// GitHub's mergeable_state values meaning the merge button works. `unstable` is
+// only non-required checks failing, which the ruleset deliberately allows.
+const MERGEABLE_STATES = ['clean', 'unstable', 'has_hooks'];
+
 // CI runs these straight out of the PR checkout, so a PR that edits them could
 // run different code than the repo's. Don't approve a run for such a PR.
 const UNSAFE_TO_AUTO_APPROVE = ['.github/', 'scripts/'];
 
-const REPO_URL = `https://github.com/${process.env.GITHUB_REPOSITORY}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const git = (args) => execFileSync('git', args, { encoding: 'utf8' });
 
 module.exports = async function automerge({ github, context, core }) {
   const { owner, repo } = context.repo;
@@ -198,7 +204,7 @@ async function getPrWithMergeability(github, owner, repo, n) {
   let pr;
   for (let i = 0; i < 6; i++) {
     ({ data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: n }));
-    if (pr.mergeable !== null) break;
+    if (pr.mergeable !== null && pr.mergeable_state !== 'unknown') break;
     await sleep(2000);
   }
   return pr;
@@ -292,115 +298,26 @@ async function evaluate({ github, core, owner, repo, defaultBranch, pr, refusals
     }
   }
 
-  // Unresolved review conversations.
-  const threads = await github.graphql(
-    `query($owner:String!,$repo:String!,$n:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$n){
-       reviewThreads(first:100){nodes{isResolved comments(first:1){nodes{url path}}}}}}}`,
-    { owner, repo, n });
-  const unresolved = threads.repository.pullRequest.reviewThreads.nodes.filter((t) => !t.isResolved);
-  if (unresolved.length > 0) {
-    const links = unresolved.slice(0, 10).map((t) => {
-      const c = t.comments.nodes[0];
-      return c ? `[\`${c.path}\`](${c.url})` : 'a thread';
-    });
-    blockers.push({
-      title: `${unresolved.length} unresolved review conversation${unresolved.length > 1 ? 's' : ''}`,
-      detail: `Reply and mark resolved once handled: ${links.join(', ')}.`,
-    });
-  }
-
-  // PR template: described and checklist ticked. The gate cannot check these.
-  blockers.push(...checkBody(pr.body));
-
-  // The repo's merge gate, run from the default branch's copy of the script.
-  const gate = runGate(core, n, pr.head.sha, defaultBranch);
-  if (gate.status === 'stale') {
-    pending.push('the PR head moved while it was being checked');
-  } else if (gate.status === 'error') {
-    holds.push({
-      title: 'The merge gate could not run',
-      detail: `Its finding is unknown, so the bot will not merge: \`${gate.message}\`. Nothing is required from you.`,
-    });
-  } else if (gate.status === 'hold') {
-    const approver = await maintainerApproval({ github, owner, repo, pr, latest });
-    if (approver) {
-      core.info(`#${n}: gate hold satisfied by @${approver}`);
+  // GitHub's own verdict is the final word. By now every cause we can explain
+  // has been listed; this catches anything else a ruleset is enforcing.
+  const explained = security.length + blockers.length + holds.length + pending.length > 0;
+  if (!explained && !MERGEABLE_STATES.includes(pr.mergeable_state)) {
+    if (pr.mergeable_state === 'unknown') {
+      pending.push('GitHub is still working out whether this is mergeable');
+    } else if (pr.mergeable_state === 'behind') {
+      blockers.push({
+        title: `Branch is behind \`${defaultBranch}\``,
+        detail: `Update it (\`git fetch upstream && git rebase upstream/${defaultBranch}\`, or use "Update branch") and push.`,
+      });
     } else {
       holds.push({
-        title: 'Touches maintainer-owned paths or dependency files',
-        detail: `${gate.paths.map((p) => `\`${p}\``).join(', ')}. The [merge gate](${REPO_URL}/blob/${defaultBranch}/scripts/merge-gate.sh) keeps changes here for human review: they change what a verdict means or add supply-chain trust. This is not a verdict on your work, and nothing is required from you. Once a maintainer approves the **latest commit**, the bot merges it. A new push clears that approval.`,
+        title: `GitHub reports this PR as \`${pr.mergeable_state}\``,
+        detail: 'A repository rule the bot cannot see through is blocking the merge. A maintainer needs to look; nothing is required from you unless a reviewer asks.',
       });
     }
   }
 
   return { security, blockers, holds, pending };
-}
-
-function checkBody(body) {
-  const out = [];
-  const text = (body || '').replace(/<!--[\s\S]*?-->/g, '');
-
-  // Text between the "What changed and why" heading and the next heading.
-  const heading = text.match(/^##[ \t]*What changed and why[ \t]*$/im);
-  let described = '';
-  if (heading) {
-    const rest = text.slice(heading.index + heading[0].length);
-    const next = rest.search(/^##\s/m);
-    described = next === -1 ? rest : rest.slice(0, next);
-  }
-  if (described.trim() === '') {
-    out.push({
-      title: 'The PR description does not say what changed and why',
-      detail: 'Fill in the "What changed and why" section of the PR template.',
-    });
-  }
-
-  const unticked = [...text.matchAll(/^[ \t]*[-*][ \t]+\[ \][ \t]+(.+)$/gm)].map((m) => m[1].replace(/\*\*/g, '').trim());
-  const ticked = [...text.matchAll(/^[ \t]*[-*][ \t]+\[[xX]\][ \t]+/gm)];
-  if (unticked.length + ticked.length === 0) {
-    out.push({
-      title: 'The PR checklist is missing',
-      detail: `Restore the checklist from [the PR template](${REPO_URL}/blob/HEAD/.github/PULL_REQUEST_TEMPLATE.md) and tick each item that is true.`,
-    });
-  } else if (unticked.length > 0) {
-    out.push({
-      title: `${unticked.length} checklist item${unticked.length > 1 ? 's' : ''} not ticked`,
-      detail: unticked.map((t) => `\n   - ${t.length > 110 ? t.slice(0, 107) + '...' : t}`).join('') +
-        '\n   Tick each box you can honestly stand behind, or explain in the description why one does not apply.',
-    });
-  }
-  return out;
-}
-
-// Runs scripts/merge-gate.sh (the default branch's copy) over the PR's commits.
-function runGate(core, n, headSha, defaultBranch) {
-  try {
-    git(['fetch', '--no-tags', '--quiet', 'origin', `+refs/pull/${n}/head:refs/remotes/pr/${n}`]);
-    if (git(['rev-parse', `refs/remotes/pr/${n}`]).trim() !== headSha) return { status: 'stale' };
-    const base = git(['merge-base', `origin/${defaultBranch}`, headSha]).trim();
-    const r = spawnSync('./scripts/merge-gate.sh', [base, headSha], { encoding: 'utf8' });
-    if (r.status === 0) return { status: 'clean' };
-    if (r.status === 1) {
-      const paths = r.stdout.split('\n').filter((l) => /^ {2}\S/.test(l)).map((l) => l.trim());
-      return { status: 'hold', paths };
-    }
-    return { status: 'error', message: `exit ${r.status}: ${(r.stderr || r.stdout).trim().slice(0, 300)}` };
-  } catch (err) {
-    core.warning(`gate failed for #${n}: ${err.message}`);
-    return { status: 'error', message: String(err.message).slice(0, 300) };
-  }
-}
-
-// A held PR may merge once someone with write access approved the current head.
-async function maintainerApproval({ github, owner, repo, pr, latest }) {
-  for (const [login, r] of latest) {
-    if (r.state !== 'APPROVED' || r.commit_id !== pr.head.sha || login === pr.user.login) continue;
-    try {
-      const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: login });
-      if (['admin', 'write'].includes(data.permission)) return login;
-    } catch (_) { /* not a collaborator */ }
-  }
-  return null;
 }
 
 // ----------------------------------------------------------------- comments
@@ -435,7 +352,7 @@ function render(pr, ev, state) {
 }
 
 function renderMerged(pr) {
-  return `${MARKER}\n### Automerge: merged\n\nAll conditions were met for \`${pr.head.sha.slice(0, 7)}\` (CI green, merge gate clear, checklist complete, no open review conversations). Squash-merged. Thanks @${pr.user.login}!`;
+  return `${MARKER}\n### Automerge: merged\n\nGitHub reported \`${pr.head.sha.slice(0, 7)}\` mergeable and the malware scan passed. Squash-merged. Thanks @${pr.user.login}!`;
 }
 
 async function upsertComment({ github, owner, repo, n, body, act, onlyIfExists = false }) {

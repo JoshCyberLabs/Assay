@@ -23,10 +23,14 @@ paths:
           required: false
           schema:
             type: string
-            pattern: '^G[A-Z2-7]{55}$'
+            pattern: '^(G[A-Z2-7]{55}|M[A-Z2-7]{68})$'
           example: GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H
           description: >-
-            Optional holder account ID (G..., 56 characters). Answers "am I
+            Optional holder account ID: a G... account (56 characters) or an
+            M... muxed account (69 characters). A muxed address is resolved to
+            its base G... account for the trustline lookup, and the evidence
+            records the original address, its multiplexing id, and the account
+            that was read. Answers "am I
             exposed?" for that account: the scan reads the holder's trustline
             and adds a "trustline" finding with the trustline's
             is_clawback_enabled and is_authorized flags, adding the
@@ -50,8 +54,8 @@ paths:
                 $ref: '#/components/schemas/Report'
         '400':
           description: >-
-            Invalid request parameters (including a holder that is not a G...
-            account ID), or an asset identifier naming the
+            Invalid request parameters (including a holder that is neither a
+            G... account nor an M... muxed account), or an asset identifier naming the
             network's native asset (native/XLM), which has no issuer and no
             authorization flags and is therefore never scanned or attested.
           content:
@@ -121,6 +125,40 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /api/v1/events:
+    get:
+      summary: Server-sent events stream for capability, severity, and accountability transitions
+      description: >-
+        Opens a long-lived SSE connection that pushes a message whenever a stored
+        observation produces a transition. The stream includes heartbeats every
+        15 seconds to keep the connection alive through proxies. Connections are
+        capped at 100 concurrent clients per server instance.
+      responses:
+        '200':
+          description: A stream of transition events in SSE format.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Each event is a JSON object with asset, transition, and timestamp fields.
+        '400':
+          description: Missing or invalid asset parameter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Too many concurrent SSE connections. Retry-After header gives seconds to wait.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: SSE not supported by the server infrastructure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /api/v1/exposure:
     get:
       summary: List trustlines held by an account with per-asset severity and trustline finding
@@ -135,7 +173,10 @@ paths:
           required: true
           schema:
             type: string
-          description: Holder's account address (G...)
+          description: >-
+            Holder's account address: a G... account, or an M... muxed account
+            that resolves to one. A muxed account's trustlines are read from
+            its base G... account, and the evidence records the resolution.
         - name: limit
           in: query
           required: false
