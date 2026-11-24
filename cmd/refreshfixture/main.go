@@ -2,11 +2,6 @@
 // in PROVENANCE.md and prints what changed, so a maintainer can judge whether a
 // moved verdict reflects a real change or a regression.
 //
-// By default the command blocks if re-capturing the fixture would change the
-// subject's eval verdict, because docs/eval.md says a disputed label is never
-// silently edited. Pass -accept-verdict-change to proceed; the change is
-// recorded in PROVENANCE.md.
-//
 // It requires network access and is therefore not run by CI. Invoke it through
 // the make target:
 //
@@ -17,7 +12,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -28,67 +25,90 @@ import (
 )
 
 func main() {
-	subject := flag.String("subject", "", "fixture directory to re-capture, e.g. aqua-clear-verified")
-	root := flag.String("root", "internal/mechanics/testdata", "fixture root holding PROVENANCE.md and manifest.json")
-	dryRun := flag.Bool("dry-run", false, "show the diff without writing")
-	acceptVerdictChange := flag.Bool("accept-verdict-change", false, "proceed even when re-capturing changes the subject's eval verdict")
-	flag.Parse()
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr, &fixtures.Refresher{Client: http.DefaultClient}))
+}
+
+type refresher interface {
+	Refresh(context.Context, string, string, bool) (*fixtures.Result, error)
+}
+
+// applier is implemented by a refresher that can write a set of changes it has
+// already fetched, which lets the verdict-change guard run between fetching and
+// writing without a second round of network requests.
+type applier interface {
+	Apply(root, subject string, changes []fixtures.Change) error
+}
+
+func run(args []string, stdout, stderr io.Writer, r refresher) int {
+	fs := flag.NewFlagSet("refreshfixture", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	subject := fs.String("subject", "", "fixture directory to re-capture, e.g. aqua-clear-verified")
+	root := fs.String("root", "internal/mechanics/testdata", "fixture root holding PROVENANCE.md and manifest.json")
+	dryRun := fs.Bool("dry-run", false, "show the diff without writing")
+	acceptVerdictChange := fs.Bool("accept-verdict-change", false, "proceed even when re-capturing changes the subject's eval verdict")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
 
 	if *subject == "" {
-		fmt.Fprintln(os.Stderr, "usage: refresh-fixture -subject <dir> [-root <dir>] [-dry-run] [-accept-verdict-change]")
-		os.Exit(2)
+		_, _ = fmt.Fprintln(stderr, "usage: refresh-fixture -subject <dir> [-root <dir>] [-dry-run] [-accept-verdict-change]")
+		return 2
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	r := &fixtures.Refresher{}
-	res, err := r.Refresh(ctx, *root, *subject, false)
+	ap, canGuard := r.(applier)
+	// With an applier the fetch is a preview and the write happens after the
+	// verdict guard; without one the refresher fetches and writes in one step.
+	res, err := r.Refresh(ctx, *root, *subject, !*dryRun && !canGuard)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "refresh %s: %v\n", *subject, err)
-		os.Exit(1)
+		_, _ = fmt.Fprintf(stderr, "refresh %s: %v\n", *subject, err)
+		return 1
 	}
 
 	if len(res.Changed) == 0 {
-		fmt.Printf("%s: no change; the fixtures match the live sources\n", *subject)
-		return
+		_, _ = fmt.Fprintf(stdout, "%s: no change; the fixtures match the live sources\n", *subject)
+		return 0
 	}
 	for _, c := range res.Changed {
-		fmt.Print(fixtures.Unified(c.File, c.Old, c.New))
+		_, _ = fmt.Fprint(stdout, fixtures.Unified(c.File, c.Old, c.New))
 	}
 	if *dryRun {
-		fmt.Printf("\n%s: %d file(s) would change (dry run; nothing written)\n", *subject, len(res.Changed))
-		return
+		_, _ = fmt.Fprintf(stdout, "\n%s: %d file(s) would change (dry run; nothing written)\n", *subject, len(res.Changed))
+		return 0
 	}
 
-	// Verdict-change guard: run eval on the refreshed fixtures before writing
-	// them so a label flip is never silent.
-	oldVerdict, newVerdict, err := checkVerdictChange(ctx, *root, *subject, res.Changed)
-	if err != nil {
-		// Verdict check is best-effort: if the subject is not in the eval
-		// corpus, LoadSubject will fail and we fall through without blocking.
-		fmt.Fprintf(os.Stderr, "verdict check skipped (%v); writing without guard\n", err)
-	} else if oldVerdict != newVerdict {
-		fmt.Printf("\nverdict would change: %s → %s\n", oldVerdict, newVerdict)
-		if !*acceptVerdictChange {
-			fmt.Fprintln(os.Stderr, "re-run with -accept-verdict-change to proceed")
-			os.Exit(1)
+	var oldVerdict, newVerdict string
+	if canGuard {
+		// Verdict-change guard: run eval on the refreshed fixtures before writing
+		// them so a label flip is never silent.
+		oldVerdict, newVerdict, err = checkVerdictChange(ctx, *root, *subject, res.Changed)
+		if err != nil {
+			// Best-effort: a subject outside the eval corpus cannot be loaded, so
+			// the guard falls through rather than blocking the refresh.
+			_, _ = fmt.Fprintf(stderr, "verdict check skipped (%v); writing without guard\n", err)
+		} else if oldVerdict != newVerdict {
+			_, _ = fmt.Fprintf(stdout, "\nverdict would change: %s → %s\n", oldVerdict, newVerdict)
+			if !*acceptVerdictChange {
+				_, _ = fmt.Fprintln(stderr, "re-run with -accept-verdict-change to proceed")
+				return 1
+			}
+			_, _ = fmt.Fprintln(stdout, "verdict change accepted via -accept-verdict-change")
 		}
-		fmt.Println("verdict change accepted via -accept-verdict-change")
-	}
-
-	if err := r.Apply(*root, *subject, res.Changed); err != nil {
-		fmt.Fprintf(os.Stderr, "write %s: %v\n", *subject, err)
-		os.Exit(1)
-	}
-
-	if oldVerdict != newVerdict && oldVerdict != "" {
-		if err := annotateVerdictChange(*root, *subject, oldVerdict, newVerdict); err != nil {
-			fmt.Fprintf(os.Stderr, "record verdict change in PROVENANCE: %v\n", err)
+		if err := ap.Apply(*root, *subject, res.Changed); err != nil {
+			_, _ = fmt.Fprintf(stderr, "write %s: %v\n", *subject, err)
+			return 1
+		}
+		if err == nil && oldVerdict != newVerdict && oldVerdict != "" {
+			if aerr := annotateVerdictChange(*root, *subject, oldVerdict, newVerdict); aerr != nil {
+				_, _ = fmt.Fprintf(stderr, "record verdict change in PROVENANCE: %v\n", aerr)
+			}
 		}
 	}
 
-	fmt.Printf("\n%s: %d file(s) updated and capture date refreshed\n", *subject, len(res.Changed))
+	_, _ = fmt.Fprintf(stdout, "\n%s: %d file(s) updated and capture date refreshed\n", *subject, len(res.Changed))
+	return 0
 }
 
 // checkVerdictChange writes the refreshed files into a temp directory
