@@ -154,7 +154,7 @@ func copyDir(src, dst string) error {
 		}
 		rel, err := filepath.Rel(src, path)
 		if err != nil {
-			return err
+			return fmt.Errorf("relative path of %s: %w", path, err)
 		}
 		target := filepath.Join(dst, rel)
 		if d.IsDir() {
@@ -162,9 +162,12 @@ func copyDir(src, dst string) error {
 		}
 		b, err := os.ReadFile(path)
 		if err != nil {
-			return err
+			return fmt.Errorf("read %s: %w", path, err)
 		}
-		return os.WriteFile(target, b, 0o644)
+		if err := os.WriteFile(target, b, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", target, err)
+		}
+		return nil
 	})
 }
 
@@ -178,5 +181,8 @@ func annotateVerdictChange(root, subject, oldV, newV string) error {
 	}
 	note := fmt.Sprintf("\n`%s` verdict changed %s → %s on refresh (%s).\n",
 		subject, oldV, newV, time.Now().UTC().Format("2006-01-02"))
-	return os.WriteFile(provPath, append(prov, []byte(note)...), 0o644)
+	if err := os.WriteFile(provPath, append(prov, []byte(note)...), 0o644); err != nil {
+		return fmt.Errorf("write provenance: %w", err)
+	}
+	return nil
 }
